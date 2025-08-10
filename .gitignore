@@ -1,1 +1,5 @@
 .env
+venv/
+run.log
+debug_shots
+chrome-profile

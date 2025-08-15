@@ -1,23 +1,37 @@
 # autobook_green_nie.py
-# Persistent Chrome profile; human-like interactions; screenshots; robust “Solicitar Cita”.
-# NEW: close the whole window (persistent context) at the end of each cycle.
-#      On success, keep the window open to let you see/print the confirmation.
-#      Still plays the hard-rock alarm when a real calendar appears.
+# Persistent Chrome profile; human-like interactions; screenshots; robust flow.
+# Modes:
+#   - NIE (green NIE, original path)
+#   - TIE (new path with different office/section and identity fields)
+# NEW:
+#   - Close the whole window (persistent context) at the end of each cycle unless booked.
+#   - Alarm triggers when page at the availability stage deviates from the default “no slots” page.
+#   - TIE path has detailed screenshot breadcrumbs and robust PASAPORTE radio selection.
 
-import asyncio, os, random, sys, time, re
+import asyncio, os, random, sys, time, re, shutil
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError, Page, Locator, BrowserContext
+from pathlib import Path
 
-BUILD_TAG = "autobook vA17-close-window-per-cycle"
+BUILD_TAG = "autobook vA19-nie-or-tie-debugged"
 
 # ---------------- Config ----------------
 PORTAL_URL = "https://sede.administracionespublicas.gob.es/pagina/index/directorio/icpplus"
 
+# Load .env before reading anything from it
+load_dotenv()
+
+# Select flow: "NIE" (green NIE, current) or "TIE"
+TRAMITE_MODE = os.getenv("TRAMITE_MODE", "NIE").strip().upper()  # values: "NIE" or "TIE"
+
 PROVINCIA_KEY  = "illes balears"
 TRAMITE_TOKENS = ["certificado de registro", "ciudadano", "u.e"]
 AUTH_USE_CLAVE = False   # always SIN Cl@ve
+
+# Debug screenshots
+LOG_SHOTS       = os.getenv("LOG_SHOTS", "0") == "1"
 CLEAR_SHOTS_EACH_CYCLE = True
 
 FILTER_OFFICES_TO_MALLORCA = True
@@ -35,7 +49,7 @@ READ_PAUSE  = (1.2,  2.6)
 
 # Retry cadence (seconds)
 RETRY_RANGE   = (2*60, 5*60)
-BACKOFF_RANGE = (20*60, 30*60)
+BACKOFF_RANGE = (7*60, 10*60)
 
 HEADLESS = False
 PROFILE_DIR     = "./chrome-profile"
@@ -43,24 +57,35 @@ LOCALE          = "es-ES"
 TIMEZONE_ID     = "Europe/Madrid"
 ACCEPT_LANGUAGE = "es-ES,es;q=0.9,en;q=0.8"
 TRY_STEALTH     = True   # optional (pip install playwright-stealth)
-LOG_SHOTS       = os.getenv("LOG_SHOTS", "0") == "1"
 
 # Alarm
 PLAY_ALARM_ON_CALENDAR = True
-ALARM_URL = os.getenv("ALARM_URL", "").strip()  # direct MP3/OGG URL (optional)
+
+import base64, mimetypes, pathlib
+def data_url_for_audio(path: str) -> str:
+    p = pathlib.Path(path).resolve()
+    mime = mimetypes.guess_type(p.name)[0] or "audio/mpeg"
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+ALARM_URL = data_url_for_audio("/Users/silveregangloff/Desktop/Cita Previa/cita_previa/Thunderstruck.mp3")
 
 # -------------- Personal data --------------
-load_dotenv()
 def need(k: str) -> str:
     v = os.getenv(k, "").strip()
     if not v: raise ValueError(f"Missing {k} in .env")
     return v
 
+# NIE (green) flow identity (the site may still ask these later in TIE)
 NIE_DNI     = need("NIE_DNI")
 FULL_NAME   = need("FULL_NAME")
 NATIONALITY = need("NATIONALITY")
 EMAIL       = need("EMAIL")
 PHONE       = need("PHONE")
+
+# TIE-specific identity (passport)
+PASSPORT_NUMBER = os.getenv("PASSPORT_NUMBER", "").strip()  # required when TRAMITE_MODE="TIE"
+BIRTH_YEAR      = os.getenv("BIRTH_YEAR", "").strip()       # 4-digit string, e.g., "1989"
 
 # -------------- Utilities --------------
 def log(msg: str) -> None:
@@ -76,18 +101,15 @@ def _all(text: str, toks: list[str]) -> bool: return all(t.lower() in text.lower
 def _any(text: str, toks: list[str]) -> bool: return any(t.lower() in text.lower() for t in toks)
 def _none(text: str, toks: list[str]) -> bool: return all(t.lower() not in text.lower() for t in toks)
 
-# --- helpers (put near snap()) ---
-import shutil
 def reset_shots_dir():
     if not LOG_SHOTS:
         return
     p = Path("debug_shots")
     try:
-        shutil.rmtree(p, ignore_errors=True)  # delete the whole folder
+        shutil.rmtree(p, ignore_errors=True)
     finally:
-        p.mkdir(exist_ok=True)               # recreate it
+        p.mkdir(exist_ok=True)
     log("[SHOTS] Cleared debug_shots/")
-
 
 async def snap(page: Page, tag: str):
     if not LOG_SHOTS: return
@@ -99,6 +121,14 @@ async def snap(page: Page, tag: str):
         log(f"[SHOT] {fname}")
     except Exception as e:
         log(f"[SHOT ERR] {e}")
+
+def attach_debug_listeners(page: Page) -> None:
+    """Mirror browser console and page errors into Python logs."""
+    try:
+        page.on("console", lambda m: log(f"[BROWSER {m.type}] {m.text}"))
+        page.on("pageerror", lambda e: log(f"[BROWSER ERROR] {e}"))
+    except Exception:
+        pass
 
 async def human_mouse_move(page: Page, x: float, y: float):
     cx, cy = x + random.uniform(-3, 3), y + random.uniform(-3, 3)
@@ -165,6 +195,47 @@ async def select_option_by_contains(select: Locator, needle: str) -> bool:
     return False
 
 # ---------------- Robust field helpers ----------------
+async def js_fill_birth_year(page: Page, year: str) -> bool:
+    """
+    Find a visible, enabled 4-digit year input and set it by JS with proper events.
+    """
+    if not (year and len(year) == 4 and year.isdigit()):
+        return False
+    try:
+        ok = await page.evaluate("""
+            (val) => {
+              const isVis = el => el && el.offsetParent !== null && !el.disabled;
+              const inputs = Array.from(document.querySelectorAll('input'));
+              // priority: explicit hints
+              const good = (el) => {
+                const id  = (el.id   || '').toLowerCase();
+                const nm  = (el.name || '').toLowerCase();
+                const ph  = (el.getAttribute('placeholder') || '').toLowerCase();
+                const mxl = el.getAttribute('maxlength');
+                const pat = el.getAttribute('pattern') || '';
+                if (!isVis(el)) return false;
+                if (id.includes('año') || id.includes('ano') || id.includes('anio')) return true;
+                if (nm.includes('año') || nm.includes('ano') || nm.includes('anio')) return true;
+                if (id.includes('nacim') || nm.includes('nacim')) return true;
+                if (ph.includes('aaaa')) return true;
+                if (mxl === '4') return true;
+                if (/\\d{4}/.test(pat)) return true;
+                return false;
+              };
+              const target = inputs.find(good);
+              if (!target) return false;
+              target.focus();
+              target.value = val;
+              target.dispatchEvent(new Event('input',  {bubbles:true}));
+              target.dispatchEvent(new Event('change', {bubbles:true}));
+              target.blur && target.blur();
+              return true;
+            }
+        """, year)
+        return bool(ok)
+    except Exception:
+        return False
+    
 async def accept_cookies_if_present(page: Page):
     try:
         bar = page.locator("#cookie-law-info-bar")
@@ -246,23 +317,37 @@ async def type_like_user(page: Page, locator: Locator, text: str, label: str) ->
 
 async def check_radio_robust(scope, selector: str) -> bool:
     try:
-        el = await scope.locator(selector).first.element_handle()
-        if not el: return False
-        ok = await scope.evaluate("""(el)=>{
-            el.checked=true;
-            el.dispatchEvent(new Event('input',{bubbles:true}));
-            el.dispatchEvent(new Event('change',{bubbles:true}));
-            return el.checked===true;
-        }""", el)
-        return bool(ok)
-    except Exception:
-        try:
-            await scope.locator(selector).first.check(force=True, timeout=1500)
-            return True
-        except Exception:
+        loc = scope.locator(selector).first
+        # Fast path: if it doesn't exist, bail immediately.
+        if await loc.count() == 0:
             return False
 
+        # Try JS set + dispatch (most reliable on this site)
+        el = await loc.element_handle(timeout=800)
+        if not el:
+            return False
+        ok = await (scope.evaluate if hasattr(scope, "evaluate") else scope.page.evaluate)(
+            """(el)=>{
+                el.checked = true;
+                el.dispatchEvent(new Event('input',{bubbles:true}));
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+                return el.checked === true;
+            }""",
+            el,
+        )
+        if ok:
+            return True
+
+        # Fallback to .check(force=True)
+        await loc.check(force=True, timeout=800)
+        return True
+    except Exception:
+        return False
+
 # --------- Form detection & filling ---------
+
+
+
 async def data_form_present(page: Page) -> bool:
     return (await page.locator("#txtIdCitado").count()) > 0 or (await page.locator("#txtDesCitado").count()) > 0
 
@@ -314,7 +399,11 @@ async def fill_personal(page: Page):
     log(f"→ Final NIE='{v_nie}', NAME='{v_name}'")
     await snap(page, "data-form-filled")
 
-async def check_and_fill_data_form(page: Page) -> bool:
+async def check_and_fill_data_form(page, mode="NIE"):
+    if mode.upper() == "TIE":
+        await fill_personal_tie(page)
+    else:
+        await fill_personal(page)
     if await data_form_present(page):
         log("🧾 Data form detected (early) — filling NIE/Name…")
         await fill_personal(page)
@@ -337,55 +426,92 @@ CAL_SEL = ", ".join([
 async def has_calendar(page: Page) -> bool:
     return (await page.locator(CAL_SEL).count()) > 0
 
-async def play_rock_alarm(page: Page):
-    if not PLAY_ALARM_ON_CALENDAR: return
-    log("🎸 Calendar found — playing alarm!")
+async def play_rock_alarm(page, url: str | None = None):
+    if not PLAY_ALARM_ON_CALENDAR:
+        return {"ok": False, "why": "alarm disabled"}
+
+    the_url = (url if url is not None else ALARM_URL) or ""
+    log(f"🎸 Availability signal detected — playing alarm! src[:64]={the_url[:64]!r}")
+
     try:
-        if ALARM_URL:
-            await page.evaluate("""
-                (url) => {
-                  let a = document.getElementById('__autobook_alarm__');
-                  if (!a) {
-                    a = document.createElement('audio');
-                    a.id='__autobook_alarm__'; a.autoplay=true; a.loop=false;
-                    a.src=url; a.volume=1.0;
-                    document.body.appendChild(a);
-                  }
-                  a.currentTime = 0;
-                  a.play().catch(()=>{});
+        diag = await page.evaluate(
+            """
+            async (url) => {
+              const result = {
+                ok: false,
+                created: false,
+                hadElem: false,
+                readyState: -1,
+                paused: true,
+                currentTime: 0,
+                error: null,
+                events: [],
+                srcPrefix: (url||'').slice(0, 32),
+              };
+
+              try {
+                let a = document.getElementById('__autobook_alarm__');
+                result.hadElem = !!a;
+                if (!a) {
+                  a = document.createElement('audio');
+                  a.id = '__autobook_alarm__';
+                  a.autoplay = true;
+                  a.loop = false;
+                  a.preload = 'auto';
+                  a.playsInline = true;
+                  a.muted = false;
+                  a.volume = 1.0;
+
+                  const logEv = (ev) => result.events.push(ev.type);
+                  ['loadstart','durationchange','loadedmetadata','loadeddata','canplay',
+                   'canplaythrough','play','playing','pause','timeupdate','stalled','error','ended']
+                   .forEach(ev => a.addEventListener(ev, logEv, {once:false}));
+
+                  document.body.appendChild(a);
                 }
-            """, ALARM_URL)
-        else:
-            await page.evaluate("""
-                () => {
-                  try{
-                    const ac = new (window.AudioContext||window.webkitAudioContext)();
-                    const riff = (t0) => {
-                      const osc = ac.createOscillator();
-                      const gain = ac.createGain();
-                      const dist = ac.createWaveShaper();
-                      const curve = new Float32Array(44100);
-                      for (let i=0;i<curve.length;i++){
-                        const x = i*2/curve.length-1;
-                        curve[i] = (1.5*x)/(1+Math.abs(x));
-                      }
-                      dist.curve = curve; dist.oversample='4x';
-                      osc.type='square';
-                      gain.gain.setValueAtTime(0.0001, t0);
-                      gain.gain.exponentialRampToValueAtTime(0.9, t0+0.05);
-                      gain.gain.exponentialRampToValueAtTime(0.0001, t0+2.2);
-                      osc.frequency.setValueAtTime(196, t0);
-                      osc.frequency.linearRampToValueAtTime(233, t0+0.5);
-                      osc.frequency.linearRampToValueAtTime(262, t0+1.0);
-                      osc.connect(dist); dist.connect(gain); gain.connect(ac.destination);
-                      osc.start(t0); osc.stop(t0+2.2);
-                    };
-                    for(let k=0;k<4;k++) riff(ac.currentTime + k*2.4);
-                  }catch(e){}
+
+                if (url) a.src = url;
+
+                await new Promise(r => setTimeout(r, 50));
+
+                const waitReady = () => new Promise((resolve) => {
+                  let done = false;
+                  const timer = setTimeout(() => { if (!done) { done = true; resolve(); } }, 2000);
+                  const onMeta = () => { if (!done) { done = true; clearTimeout(timer); resolve(); } };
+                  a.addEventListener('loadedmetadata', onMeta, {once:true});
+                  a.addEventListener('canplay', onMeta, {once:true});
+                });
+                await waitReady();
+
+                try {
+                  await a.play();
+                } catch (e) {
+                  result.error = String(e && e.message || e);
                 }
-            """)
+
+                await new Promise(r => setTimeout(r, 500));
+
+                result.readyState = a.readyState;
+                result.paused     = a.paused;
+                result.currentTime= a.currentTime || 0;
+                // ---- FIXED: use JS logical OR (||), not Python 'or'
+                result.ok = (result.currentTime > 0) || (result.paused === false) || result.events.includes('playing');
+              } catch (e) {
+                result.error = 'outer:' + (e && e.message || String(e));
+              }
+              return result;
+            }
+            """,
+            the_url,
+        )
+        log(f"[alarm diag] ok={diag.get('ok')} paused={diag.get('paused')} "
+            f"ready={diag.get('readyState')} t={diag.get('currentTime'):.3f} "
+            f"events={diag.get('events')[:6]} srcPrefix={diag.get('srcPrefix')!r} "
+            f"err={diag.get('error')!r}")
+        return diag
     except Exception as e:
-        log(f"Alarm error: {e}")
+        log(f"Alarm error (evaluate): {e}")
+        return {"ok": False, "why": f"evaluate exception: {e}"}
 
 async def pick_first_enabled_day(page: Page) -> bool:
     loc = page.locator(", ".join([
@@ -549,6 +675,176 @@ async def no_slots(page: Page) -> bool:
         "no hay citas disponibles", "no existen citas disponibles", "en este momento no hay citas disponibles"
     ])
 
+# --- New helpers for TIE flow and non-default detection ---
+
+async def force_fill_birth_year(page: Page, year: str) -> bool:
+    """
+    Fill the 4-digit birth year reliably, without clicking labels/radios.
+    Strategy:
+      - Find the element whose text contains 'Año de nacimiento' (or 'Ano de nacimiento'),
+        then pick the closest input within that block or immediately following it.
+      - Fallbacks: any visible enabled input with placeholder ~ 'aaaa', maxlength=4,
+        or id/name including anio/año/nacim.
+      - Set value via JS and dispatch input/change.
+    """
+    if not (year and len(year) == 4 and year.isdigit()):
+        return False
+
+    try:
+        ok = await page.evaluate(r"""
+            (val) => {
+              const norm = s => (s||'').toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g,''); // strip accents
+              const isVis = el => !!(el && el.offsetParent !== null && !el.disabled);
+
+              // 1) Find the label/block that mentions the field
+              const blocks = Array.from(document.querySelectorAll('label,div,span,strong,p'));
+              let anchor = null;
+              for (const b of blocks) {
+                const t = norm(b.innerText || b.textContent);
+                if (!t) continue;
+                if (t.includes('ano de nacimiento') || t.includes('año de nacimiento')) {
+                  anchor = b;
+                  break;
+                }
+              }
+
+              const pickInputNear = (root) => {
+                if (!root) return null;
+                // Prefer an input inside the same container
+                let inp = root.querySelector('input');
+                if (isVis(inp)) return inp;
+                // else try immediate following input in DOM order
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null);
+                walker.currentNode = root;
+                for (let i=0;i<40 && walker.nextNode();i++){
+                  const el = walker.currentNode;
+                  if (el.tagName && el.tagName.toLowerCase()==='input' && isVis(el)) return el;
+                }
+                return null;
+              };
+
+              let target = pickInputNear(anchor);
+
+              // 2) Fallback heuristics
+              if (!target) {
+                const inputs = Array.from(document.querySelectorAll('input')).filter(isVis);
+                const score = (el) => {
+                  const id  = norm(el.id);
+                  const nm  = norm(el.name);
+                  const ph  = norm(el.getAttribute('placeholder'));
+                  const mxl = el.getAttribute('maxlength');
+                  let s = 0;
+                  if (id.includes('anio') || id.includes('ano') || id.includes('año')) s += 3;
+                  if (nm.includes('anio') || nm.includes('ano') || nm.includes('año')) s += 3;
+                  if (id.includes('nacim') || nm.includes('nacim')) s += 2;
+                  if (ph && ph.includes('aaaa')) s += 2;
+                  if (mxl === '4') s += 1;
+                  return s;
+                };
+                inputs.sort((a,b)=>score(b)-score(a));
+                if (inputs.length && score(inputs[0])>0) target = inputs[0];
+              }
+
+              if (!target) return false;
+
+              // 3) Set value and fire events
+              target.focus();
+              target.value = val;
+              target.dispatchEvent(new Event('input',  {bubbles:true}));
+              target.dispatchEvent(new Event('change', {bubbles:true}));
+              target.blur && target.blur();
+              return true;
+            }
+        """, year)
+        return bool(ok)
+    except Exception:
+        return False
+
+async def choose_specific_office(page: Page, office_label_substring: str) -> bool:
+    """
+    Selects a specific office by (case-insensitive) substring match on the visible option text.
+    """
+    office = page.locator("select#sede, select[name*=oficina], select[id*=oficina], select[name*=sede]")
+    if not await office.count():
+        log("No office selector on this step.")
+        return False
+    await human_click_locator(page, office.first)
+    chosen = False
+    for opt in await office.locator("option").all():
+        txt = (await opt.text_content() or "").strip()
+        val = await opt.get_attribute("value")
+        if val and (office_label_substring.lower() in txt.lower()):
+            await office.select_option(value=val)
+            log(f"Selected office: {txt}")
+            chosen = True
+            break
+    if not chosen:
+        log("⚠️ Specific office not found among options.")
+        return False
+    await pause_step()
+    return True
+
+async def select_tramite_in_section(page: Page, section_label_regex: str, option_contains: str) -> bool:
+    """
+    Finds a <select> that is likely associated with the section label (title text near it),
+    then selects the option whose text contains `option_contains`.
+    """
+    try:
+        # Find any element whose normalized text matches the regex (case/diacritics handled by JS)
+        sec = page.locator(
+            f"xpath=//*[matches(translate(normalize-space(.), 'ÁÉÍÓÚÜÑ', 'áéíóúüñ'), {section_label_regex!r})]"
+        ).first
+    except Exception:
+        sec = page.locator("xpath=//*").first
+
+    candidate_selects = []
+    try:
+        if await sec.count():
+            near = sec.locator("xpath=following::select[1]")
+            if await near.count():
+                candidate_selects.append(near.first)
+    except Exception:
+        pass
+    candidate_selects.extend(await page.locator("select").all())
+
+    for sel in candidate_selects:
+        try:
+            for opt in await sel.locator("option").all():
+                txt = (await opt.text_content() or "").strip()
+                val = await opt.get_attribute("value")
+                if val and option_contains.lower() in txt.lower():
+                    await human_click_locator(page, sel)
+                    await sel.select_option(value=val)
+                    await pause_step()
+                    log(f"Selected trámite in section: {txt}")
+                    return True
+        except Exception:
+            continue
+    log("⚠️ Could not find the target trámite option inside/near the section.")
+    return False
+
+async def is_default_no_slots_page(page: Page) -> bool:
+    """
+    Heuristic: the 'default' negative page contains a standard 'no citas' phrase,
+    and also shows neither a calendar widget nor any time-selection controls.
+    If any calendar/time selector is present, we *do not* consider it default.
+    """
+    try:
+        html = (await page.content()).lower()
+    except Exception:
+        return False
+
+    default_phrases = [
+        "no hay citas",
+        "no existen citas disponibles"
+    ]
+    contains_default_text = any(p in html for p in default_phrases)
+
+    print("CONTAINS_DEFAULT_TEXT",contains_default_text)
+
+    return contains_default_text
+
 async def attempt_click_solicitar_cita(page: Page, wait_ms: int = 12000) -> bool:
     log("Step: try 'Solicitar Cita' (robust)…")
     deadline = time.time() + (wait_ms/1000)
@@ -634,8 +930,11 @@ async def make_context(pw) -> BrowserContext:
 
     return ctx
 
-# -------------- One cycle --------------
+# -------------- NIE flow (original) --------------
 async def run_cycle(page: Page) -> tuple[bool, bool]:
+    """
+    NIE (green) flow.
+    """
     log("Navigate to portal…")
     try:
         await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
@@ -653,7 +952,7 @@ async def run_cycle(page: Page) -> tuple[bool, bool]:
         return False, True
 
     log("Try initial Enter/Acceder/Iniciar…")
-    await click_text_human(page, r"(entrar|acceder|iniciar)")
+    await click_text_human(page, r"(acceder al procedimiento|entrar|acceder|iniciar)")
     await human_scroll(page)
 
     log("Step: select province…")
@@ -718,13 +1017,14 @@ async def run_cycle(page: Page) -> tuple[bool, bool]:
         await snap(page, "waf-calendar")
         return False, True
 
-    if await no_slots(page):
-        log("No slots — will retry later.")
-        await snap(page, "no-slots")
+    # New logic: alarm if page is NOT the default 'no slots' page
+    if await is_default_no_slots_page(page):
+        log("No slots (default page) — will retry later.")
+        await snap(page, "no-slots-default")
         return False, False
-
-    if await has_calendar(page):
+    else:
         await play_rock_alarm(page)
+        await page.wait_for_function(""" () => { const a = document.getElementById('__autobook_alarm__'); return a && a.ended; } """, timeout=0) # timeout=0 = no limit
 
     log("Step: pick earliest date…")
     if not await pick_first_enabled_day(page):
@@ -761,21 +1061,463 @@ async def run_cycle(page: Page) -> tuple[bool, bool]:
         await snap(page, "no-confirm-text")
     return booked, False
 
+# -------------- TIE flow --------------
+
+async def _select_pasaporte_radio_in_scope(scope) -> bool:
+    patterns = [
+        "input[type=radio][id*=pasap]",
+        "input[type=radio][value*=pasap]",
+        "input[type=radio][name*=tipo][value=P]",
+        "#rdbTipoDocPas",
+    ]
+    for sel in patterns:
+        # Skip quickly if nothing matches
+        if await scope.locator(sel).first.count() == 0:
+            continue
+        if await check_radio_robust(scope, sel):
+            log("✓ Radio PASAPORTE checked (pattern match).")
+            await pause_micro()
+            return True
+
+    try:
+        lab_radio = scope.get_by_label(re.compile(r"pasaport", re.I))
+        if await lab_radio.count():
+            await lab_radio.first.check(force=True, timeout=800)
+            log("✓ Radio PASAPORTE checked (get_by_label).")
+            await pause_micro()
+            return True
+    except Exception:
+        pass
+
+    try:
+        lab = scope.locator("label").filter(has_text=re.compile(r"pasaport", re.I)).first
+        if await lab.count():
+            ok = await human_click_locator(scope.page if hasattr(scope, 'page') else scope, lab)
+            if ok and await scope.locator("input[type=radio]:checked").locator("[id*=pasap], [value*=pasap]").count():
+                log("✓ Radio PASAPORTE checked (clicked label).")
+                await pause_micro()
+                return True
+    except Exception:
+        pass
+
+    try:
+        eval_fn = scope.evaluate if hasattr(scope, "evaluate") else scope.page.evaluate
+        ok = await eval_fn("""
+            () => {
+              const radios = Array.from(document.querySelectorAll('input[type=radio]'));
+              for (const r of radios) {
+                let txt = '';
+                if (r.labels && r.labels.length) {
+                  txt = Array.from(r.labels).map(L => (L.innerText||L.textContent||'')).join(' ').toLowerCase();
+                } else {
+                  const sib = r.nextSibling && r.nextSibling.textContent ? r.nextSibling.textContent : '';
+                  txt = (sib||'').toLowerCase();
+                }
+                if (txt.includes('pasaport')) {
+                  r.checked = true;
+                  r.dispatchEvent(new Event('input', {bubbles:true}));
+                  r.dispatchEvent(new Event('change', {bubbles:true}));
+                  return true;
+                }
+              }
+              return false;
+            }
+        """)
+        if ok:
+            log("✓ Radio PASAPORTE checked (JS sweep).")
+            await pause_micro()
+            return True
+    except Exception:
+        pass
+
+    log("✗ Could not select PASAPORTE radio.")
+    return False
+
+async def find_birth_year_input(page: Page) -> Locator | None:
+    """
+    Return a locator to a visible+enabled 4-digit year input.
+    Tries several robust heuristics; returns None if nothing suitable.
+    """
+    candidates = [
+        # Common ids/names/placeholders (diacritics handled by multiple patterns)
+        "input:visible:not([disabled])[id*='año']",
+        "input:visible:not([disabled])[name*='año']",
+        "input:visible:not([disabled])[id*='anio' i]",
+        "input:visible:not([disabled])[name*='anio' i]",
+        "input:visible:not([disabled])[placeholder*='aaaa' i]",
+        # very common generic field on this portal:
+        "input:visible:not([disabled])[id*=nacim i]",
+        "input:visible:not([disabled])[name*=nacim i]",
+        # Any visible text/number input with maxlength=4
+        "input:visible:not([disabled])[maxlength='4']",
+        # Any input with a 4-digit pattern
+        "input:visible:not([disabled])[pattern*='\\d{4}']",
+    ]
+    for sel in candidates:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count():
+                return loc
+        except Exception:
+            continue
+
+    # Fallback: nearest input after a label containing "Año de nacimiento"/"Ano de nacimiento"
+    try:
+        xp = (
+            "xpath=(//label|//span|//div|//strong)"
+            "[contains(translate(normalize-space(.),'ÁÉÍÓÚÜÑ','áéíóúüñ'), 'año de nacimiento') or "
+            " contains(translate(normalize-space(.),'ÁÉÍÓÚÜÑ','áéíóúüñ'), 'ano de nacimiento')]"
+            "/following::input[1]"
+        )
+        loc = page.locator(xp).first
+        if await loc.count():
+            # must be visible and not disabled
+            if await loc.is_visible() and not await loc.is_disabled():
+                return loc
+    except Exception:
+        pass
+    return None
+
+async def select_pasaporte_radio(page: Page) -> bool:
+    """
+    Select PASAPORTE via a real user-like click so the portal's JS swaps the form.
+    Prefer the radio by accessible name; fall back to label[for] -> input#id.
+    """
+    log("🔘 Selecting PASAPORTE via real click…")
+
+    # 1) Try role=radio by accessible name
+    try:
+        radio_by_name = page.get_by_role("radio", name=re.compile(r"pasaport", re.I)).first
+        if await radio_by_name.count():
+            await radio_by_name.scroll_into_view_if_needed()
+            await radio_by_name.click(force=True, delay=120)
+            return True
+    except Exception:
+        pass
+
+    # 2) Disambiguate labels: pick label[for] whose text says PASAPORTE, then click its input#for
+    try:
+        lab = page.locator("label[for]").filter(has_text=re.compile(r"pasaport", re.I)).first
+        if await lab.count():
+            for_attr = await lab.get_attribute("for")
+            if for_attr:
+                radio = page.locator(f"input[type=radio]#{for_attr}").first
+                if await radio.count():
+                    await radio.scroll_into_view_if_needed()
+                    await radio.click(force=True, delay=120)
+                    return True
+            # Fallback: click the label itself (less ideal, but works if it’s bound correctly)
+            await lab.scroll_into_view_if_needed()
+            await lab.click(force=True, delay=120)
+            return True
+    except Exception:
+        pass
+
+    # 3) Last resort: any radio whose nearby label contains 'pasaport'
+    try:
+        ok = await page.evaluate("""
+            () => {
+              const isVis = el => !!(el && el.offsetParent !== null);
+              const radios = Array.from(document.querySelectorAll('input[type=radio]')).filter(isVis);
+              for (const r of radios) {
+                let txt = '';
+                if (r.labels && r.labels.length) {
+                  txt = Array.from(r.labels).map(L => (L.innerText||L.textContent||'')).join(' ').toLowerCase();
+                } else {
+                  const sib = r.nextSibling && r.nextSibling.textContent ? r.nextSibling.textContent : '';
+                  txt = (sib||'').toLowerCase();
+                }
+                if (txt.includes('pasaport')) { r.click(); return true; }
+              }
+              return false;
+            }
+        """)
+        if ok:
+            return True
+    except Exception:
+        pass
+
+    log("⚠️ Could not find a clickable PASAPORTE radio.")
+    return False
+
+async def fill_personal_tie(page: Page) -> bool:
+    """
+    TIE identity page:
+      - Force-lock PASAPORTE
+      - Fill passport number into the main ID field (#txtIdCitado or similar)
+      - Fill Name
+      - Fill Birth Year (JS)
+      - Re-lock PASAPORTE again
+      - Click Aceptar
+    """
+    log("🧾 TIE identity form — filling Passport/Name/Year…")
+    await accept_cookies_if_present(page)
+    await snap(page, "tie-form-start")
+
+    # Soft presence check
+    try:
+        await page.wait_for_function("""() => {
+            const t = document.body.innerText.toLowerCase();
+            return t.includes('tipo de documento') || t.includes('año de nacimiento') || t.includes('ano de nacimiento');
+        }""", timeout=15000)
+    except PWTimeoutError:
+        pass
+    await snap(page, "tie-identity-visible")
+
+    # 1) Click PASAPORTE like a human so the form really swaps
+    ok_click = await select_pasaporte_radio(page)
+    await page.wait_for_timeout(250)  # let their JS start
+
+    # 2) Wait until the *checked* radio is the PASAPORTE one (diacritics-insensitive)
+    try:
+        await page.wait_for_function(r"""
+            () => {
+            const norm = s => (s||'').toLowerCase()
+                .normalize('NFD').replace(/[\u0300-\u036f]/g,''); // strip accents
+            const radios = Array.from(document.querySelectorAll('input[type=radio]'));
+            for (const r of radios) {
+                if (!r.checked) continue;
+                let txt = '';
+                if (r.labels && r.labels.length) {
+                txt = Array.from(r.labels).map(L => (L.innerText||L.textContent||'')).join(' ');
+                } else {
+                const sib = r.nextSibling && r.nextSibling.textContent ? r.nextSibling.textContent : '';
+                txt = sib || '';
+                }
+                if (norm(txt).includes('pasaport')) return true;
+            }
+            return false;
+            }
+        """, timeout=4000)
+    except PWTimeoutError:
+        log("⚠️ PASAPORTE does not appear as the checked radio — proceeding but form may still be NIE.")
+
+    await snap(page, "tie-after-radio-human-click")
+
+    # 2) Main ID field (same element across modes on this portal)
+    id_field = page.locator(
+        "#txtIdCitado, "
+        "input:visible:not([disabled])[id*=pasap i], "
+        "input:visible:not([disabled])[name*=pasap i], "
+        "input:visible:not([disabled])[id*=documento i], "
+        "input:visible:not([disabled])[name*=documento i]"
+    ).first
+    if await id_field.count() and PASSPORT_NUMBER:
+        await type_like_user(page, id_field, PASSPORT_NUMBER.upper(), "Documento (passport)")
+    else:
+        log("⚠️ Could not find main ID field to type passport.")
+
+    # 3) Name
+    name_field = page.locator(
+        "#txtDesCitado, "
+        "input:visible:not([disabled])[id*=nombre i], "
+        "input:visible:not([disabled])[name*=nombre i]"
+    ).first
+    if await name_field.count():
+        await type_like_user(page, name_field, FULL_NAME.upper(), "Nombre y apellidos")
+    else:
+        log("⚠️ Name input not found.")
+
+    # 4) Birth Year (robust, try label association)
+    year_label = page.locator("label:has-text('AÑO')")
+    if await year_label.count():
+        await year_label.scroll_into_view_if_needed()
+        # Try to find input *near* the label
+        year_field = year_label.locator("xpath=following::input[1]").first
+    else:
+        # Fallback: search for any input with año/id pattern
+        year_field = page.locator(
+            "input[placeholder*='año' i], input[id*='ano' i], input[name*='ano' i]"
+        ).first
+
+    if await year_field.count() and BIRTH_YEAR:
+        await year_field.scroll_into_view_if_needed()
+        await year_field.click(force=True)
+        await year_field.fill("")
+        await year_field.type(str(BIRTH_YEAR), delay=50)
+        log(f"✓ Year: {BIRTH_YEAR} typed normally")
+    else:
+        log("⚠️ Could not find year field")
+
+    # 5) Re-lock PASAPORTE just before submitting (in case any focus flipped it)
+    await select_pasaporte_radio(page)
+
+    # 6) Submit
+    if not await click_text_human(page, r"(aceptar|continuar|siguiente|confirmar)"):
+        await click_text_human(page, r"(enviar|guardar)")
+    await pause_read()
+    await snap(page, "after-tie-form")
+    return True
+
+async def run_cycle_tie(page: Page) -> tuple[bool, bool]:
+    log("Navigate to portal…")
+    try:
+        await page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=60000)
+        await pause_read()
+        await snap(page, "landed")
+        await human_scroll(page)
+    except Exception as e:
+        log(f"Nav error: {e}")
+        await snap(page, "nav-error")
+        return False, False
+
+    if await waf_rejected(page):
+        log("WAF rejection page detected right after landing.")
+        await snap(page, "waf-landing")
+        return False, True
+
+    # Page 1: "Acceder al procedimiento"
+    log("Step: Acceder al procedimiento…")
+    await click_text_human(page, r"(acceder al procedimiento|acceder|entrar|iniciar)")
+    await pause_read(); await snap(page, "tie-after-acceder"); await human_scroll(page)
+
+    # Page 2: select province Illes Balears, Acceptar
+    log("Step: select province…")
+    provincia = page.locator("select#form, select[name*=provincia], select[id*=provincia]")
+    try:
+        await provincia.first.wait_for(timeout=20000)
+    except PWTimeoutError:
+        log("Province select not found.")
+        await snap(page, "no-province")
+        return False, False
+    if not await select_option_by_contains(provincia, PROVINCIA_KEY):
+        log("Could not select province.")
+        await snap(page, "province-fail")
+        return False, False
+    await click_text_human(page, r"(aceptar|continuar|siguiente)")
+    await pause_read(); await snap(page, "tie-after-province"); await human_scroll(page)
+
+    # Page 3: Office + section trámites
+    log("Step: select 'Oficina de Extranjería de Palma'…")
+    if not await choose_specific_office(page, "oficina de extranjería de palma"):
+        await snap(page, "tie-office-fail")
+        return False, False
+    await snap(page, "tie-after-office")
+
+    log("Step: under 'TRÁMITES OFICINAS DE EXTRANJERÍA' select 'SOLICITUD AUTORIZACIONES'…")
+    ok_tram = await select_tramite_in_section(
+        page,
+        section_label_regex=r".*tr[aá]mites\s+oficinas\s+de\s+extranjer[ií]a.*",
+        option_contains="solicitud autorizac"
+    )
+    if not ok_tram:
+        await snap(page, "tie-tramite-fail")
+        return False, False
+    await click_text_human(page, r"(aceptar|continuar|siguiente)")
+    await pause_read(); await snap(page, "tie-after-tramite"); await human_scroll(page)
+
+    # Page 4: auth "sin clave"
+    log("Step: auth mode (SIN CL@VE)…")
+    await click_auth_mode(page, use_clave=False)
+    await snap(page, "tie-after-auth"); await human_scroll(page)
+
+    # Page 5: identity form (Passport/Name/Year)
+    await fill_personal_tie(page)
+    await snap(page, "tie-after-fill-personal")
+
+    # From here: same availability logic
+    log("Step: try 'Solicitar Cita' (robust)…")
+    try:
+        solicitar_btn = page.get_by_role("button", name=re.compile(r"solicitar cita", re.I))
+        await solicitar_btn.click(timeout=7000)  # wait longer if needed
+        log("✓ 'Solicitar Cita' clicked.")
+        await snap(page, "tie-after-solicitar-cita")
+    except PWTimeoutError:
+        log("⚠️ 'Solicitar Cita' not found — verifying bounce-back form...")
+        if await page.locator("text=Tipo de documento").count():
+            log("↩️ Bounce-back form detected, refilling...")
+            await check_and_fill_data_form(page, mode="TIE")
+        else:
+            log("❌ Neither button nor bounce-back form found")
+
+    log("Step: wait for calendar or 'no citas'…")
+    await check_and_fill_data_form(page, mode="TIE")  # in case portal bounces back an extra form
+    try:
+        await page.wait_for_function(f"""() => {{
+            const t = document.body.innerText.toLowerCase();
+            return t.includes('no hay citas disponibles') || t.includes('no existen citas disponibles') ||
+                   document.querySelector({CAL_SEL!r});
+        }}""", timeout=25000)
+    except PWTimeoutError:
+        log("Calendar/no-citas did not appear in time.")
+        await snap(page, "tie-no-calendar-wait-timeout")
+
+    if await waf_rejected(page):
+        log("WAF rejection detected at calendar step.")
+        await snap(page, "waf-calendar")
+        return False, True
+
+    if await is_default_no_slots_page(page):
+        log("No slots (default page) — will retry later.")
+        await snap(page, "tie-no-slots-default")
+        return False, False
+    else:
+        await play_rock_alarm(page)
+        await page.wait_for_function(""" () => { const a = document.getElementById('__autobook_alarm__'); return a && a.ended; } """, timeout=0) # timeout=0 = no limit
+
+    # If there is a calendar, proceed; otherwise stop so you can inspect manually
+    if not await has_calendar(page):
+        log("No calendar visible after alarm — leaving window for manual check.")
+        await snap(page, "tie-non-default-no-calendar")
+        return False, False
+
+    log("Step: pick earliest date…")
+    if not await pick_first_enabled_day(page):
+        log("Could not click a calendar day.")
+        await snap(page, "tie-no-day")
+        return False, False
+    await pause_step()
+
+    log("Step: pick earliest time…")
+    if not await pick_first_time(page):
+        log("Could not pick a time.")
+        await snap(page, "tie-no-time")
+        return False, False
+    await pause_step()
+
+    log("Step: continue to data form…")
+    await click_text_human(page, r"(continuar|siguiente|aceptar|confirmar)")
+    await pause_read(); await snap(page, "tie-before-data-form")
+
+    if await data_form_present(page):
+        # Reuse existing routine for any final NIE/Name page variants
+        await fill_personal(page)
+        log("Step: submit personal data…")
+        if not await click_text_human(page, r"(confirmar|reservar|finalizar|aceptar)"):
+            await click_text_human(page, r"(enviar|guardar)")
+        await pause_read(); await snap(page, "tie-after-data-form")
+
+    log("Step: check confirmation…")
+    booked = await confirmation_detected(page)
+    if booked:
+        log("✅ Cita confirmada. Leaving this window open for the resguardo.")
+        await snap(page, "tie-confirmed")
+    else:
+        log("No confirmation text detected (may still be booked — check tab).")
+        await snap(page, "tie-no-confirm-text")
+    return booked, False
+
 # -------------- Runner --------------
 async def main():
-    log("Auto-booking green NIE (Mallorca-only, closes window per iteration) — starting.")
+    log(f"Auto-booking ({TRAMITE_MODE}) — starting. Closes window per iteration unless booked.")
     log(f"Running build: {BUILD_TAG}")
+    booked = False
+    blocked = False
     async with async_playwright() as pw:
         while True:
             if CLEAR_SHOTS_EACH_CYCLE:
-                reset_shots_dir() 
-            # NEW: create a fresh *window* (persistent context) each cycle
+                reset_shots_dir()
+            # Fresh *window* (persistent context) each cycle
             ctx = await make_context(pw)
             page = await ctx.new_page()
+            attach_debug_listeners(page)
             t0 = time.time()
-
+            
             try:
-                booked, blocked = await run_cycle(page)
+                if TRAMITE_MODE == "TIE":
+                    booked, blocked = await run_cycle_tie(page)
+                else:
+                    booked, blocked = await run_cycle(page)
             finally:
                 if booked:
                     # Do NOT close the window on success so you can see/print the resguardo
@@ -803,3 +1545,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("Stopped by user.")
         sys.exit(0)
+
+
